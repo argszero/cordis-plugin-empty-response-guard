@@ -1,0 +1,28 @@
+# The @argszero/cordis-plugin-empty-response-guard bundle patch. Mounting needs
+# no configuration: mode='error' by default.
+#
+#   - set:
+#       - id: empty-response-guard
+#         config:
+#           mode: warn              # error | warn | off
+#           minReasoningChars: 0    # require N chars of reasoning first
+#
+# What it guards (discussion #6218): a provider completion carrying only
+# `reasoning_content`, ending with `stop`. The DeepSeek adapter's degeneracy
+# guard tests `order.length === 0` (translate.ts:135), but a reasoning block is
+# opened through the same `open()` helper (:160), so the check can never fire on
+# this shape — the turn is reported as a successful `stop` and ends with no
+# visible output, no error, and no retry.
+#
+# Because EMPTY_RESPONSE is in DEFAULT_RETRYABLE_CODES (retry-policy.ts:18-24),
+# the silent success also disables the retry the guard exists to trigger.
+#
+# mode='error' restores that: the finish is replaced with an EMPTY_RESPONSE
+# error, which the agent loop routes to agent/request-error
+# (agent-loop/src/agent.ts:443-453) where @deepseek-ai/dsh-llm-retry (mounted in
+# bundle/base and bundle/sdk-minimal) retries it. Reasoning content is never
+# removed — only the classification of the turn changes.
+
+- insert:
+    - id: empty-response-guard
+      name: '@argszero/cordis-plugin-empty-response-guard'
