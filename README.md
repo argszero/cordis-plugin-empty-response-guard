@@ -22,6 +22,7 @@ decides that with the number of opened blocks:
 
 ```js
 // packages/llm/llm-deepseek/src/translate.ts
+// (0.1.6+ moved it, unchanged, to src/protocols/chat-completions/translate.ts)
 function open(kind) { const block = { index: nextIndex++, kind, text: '' }; order.push(block); return block }  // :120-124
 // :135
 reason: reason.kind === 'stop' && order.length === 0 ? { kind: 'error', failure: { …, code: EMPTY_RESPONSE_CODE } } : reason
@@ -165,9 +166,26 @@ upstream decides, this keeps the failure visible and retryable.
 
 ## Compatibility
 
-Peer-compatible with `@deepseek-ai/dsh-llm` on the **0.1.2-rc** and **0.1.5**
-lines (see `test/peer-range.test.js` for why a bare `>=0.1.2` range would match
-nothing).
+Peer-compatible with `@deepseek-ai/dsh-llm` on the **0.1.3**, **0.1.5** and
+**0.1.6** lines — each one has had the full suite run against it. The seam the
+plugin needs (`llm/stream`, `EMPTY_RESPONSE_CODE`, `chunkHasVisibleText`) is
+complete from `0.1.3-alpha.2` onward.
+
+Two corrections came out of running that check rather than trusting the range:
+
+- **0.1.6 was excluded until 0.2.1.** A comparator admits a prerelease only when
+  it shares that prerelease's `major.minor.patch`, so `>=0.1.5-alpha.1 <0.2.0`
+  is not "0.1.5 and later" — it silently drops every `0.1.6-*` release one
+  `npm install` after `0.1.6-alpha.2` became the `alpha` dist-tag.
+- **0.1.2-rc.1 was claimed and is not supportable.** That release has no
+  `assistant-stream` module, so `chunkHasVisibleText` does not exist there and
+  `tsc` fails before a single test runs. The range admitted the version; nobody
+  had run the code against it. It is now excluded, so an unsupported line fails
+  loudly at install time instead of at load time.
+
+`test/peer-range.test.js` computes admission over the published version list
+with `semver` and asserts the admitted set exactly, so neither an accidental
+extra line nor a missing one can pass a regex-shaped test again.
 
 ## Tests
 

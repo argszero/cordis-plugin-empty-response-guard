@@ -1,45 +1,90 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { satisfies } from 'semver'
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 
 /**
- * Guard the peer range against the two ways it has already been wrong.
+ * Every `@deepseek-ai/dsh-llm` version published as of 2026-09-18, oldest
+ * first; `npm view @deepseek-ai/dsh-llm versions` refreshes it.
  *
- * Every dsh release published today is a prerelease (0.1.2-rc.1, 0.1.5-rc.1,
- * ...), and a semver comparator only admits prereleases that share its own
- * major.minor.patch tuple. That makes two natural-looking ranges fail:
- *
- *   ">=0.1.2"             matches NOTHING -> npm install dies with ETARGET
- *   ">=0.1.2-rc.1 <0.2.0" matches only 0.1.2-rc.1 -> a 0.1.5-line user gets
- *                         ERESOLVE, because the 0.1.5 tuple dsh-llm publishes
- *                         peers against is not 0.1.2
- *
- * This package's own consumers hit exactly that: `@deepseek-ai/dsh-llm` is a
- * peer here, so an unsatisfiable range is not a devDependency nuisance the user
- * can paper over with `--legacy-peer-deps` — it breaks the install.
+ * The list is deliberately frozen: it is a record of what the range was checked
+ * against, not a live query. A version published later is not covered by this
+ * test — that is what the release checklist is for.
  */
-test('peer range admits both supported dsh prerelease lines', () => {
+const PUBLISHED = [
+  '0.0.1-rc.1', '0.0.1-rc.2', '0.0.1-rc.3', '0.0.1-rc.5',
+  '0.1.0-rc.2', '0.1.0-rc.3', '0.1.0-rc.6', '0.1.0-rc.7', '0.1.0-rc.8',
+  '0.1.1-rc.1', '0.1.1-rc.2',
+  '0.1.2-alpha.2', '0.1.2-alpha.3', '0.1.2-alpha.4', '0.1.2-alpha.5',
+  '0.1.2-rc.1',
+  '0.1.3-alpha.2',
+  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2',
+  '0.1.6-alpha.1', '0.1.6-alpha.2',
+]
+
+/**
+ * The versions this plugin is expected to install against. The seam it needs —
+ * `llm/stream`, `EMPTY_RESPONSE_CODE`, and `chunkHasVisibleText` — is complete
+ * only from 0.1.3-alpha.2 onward; each line listed here has had the full suite
+ * run against it (`npm i --no-save @deepseek-ai/dsh-llm@<line> && npm test`).
+ *
+ * 0.1.2-rc.1 was claimed by 0.2.0 and is **not** supportable: that release has
+ * no `assistant-stream` module at all, so `chunkHasVisibleText` is not merely
+ * where the plugin expects it, it does not exist — `tsc` fails on src/index.ts
+ * before a single test runs. The range *admitted* the version; nobody had run
+ * the code against it. A range is a claim, and a claim is only as good as the
+ * last time someone tried it.
+ */
+const SUPPORTED = [
+  '0.1.3-alpha.2',
+  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2',
+  '0.1.6-alpha.1', '0.1.6-alpha.2',
+]
+
+/**
+ * Guard the peer range by *computing* admission, not by pattern-matching it.
+ *
+ * Every dsh release published today is a prerelease, and a semver comparator
+ * admits a prerelease only when some comparator in the same group shares its
+ * major.minor.patch tuple. So the natural-looking ranges fail silently:
+ *
+ *   ">=0.1.2"               matches NOTHING -> npm install dies with ETARGET
+ *   ">=0.1.2-rc.1 <0.2.0"   admits 0.1.2-rc.1 only -> 0.1.5/0.1.6 users get
+ *                           ERESOLVE, because no comparator names their tuple
+ *
+ * The 0.1.6 line was excluded by exactly that second form until 0.2.1, one
+ * release after 0.1.6-alpha.2 became the `alpha` dist-tag. A regex cannot see
+ * this: both forms *look* right. Only an evaluation over the published version
+ * list can, which is what this test does — and it asserts the admitted set
+ * exactly, so an accidental extra line (widening to a tuple the plugin was
+ * never tested on, the way 0.1.2-rc.1 was) fails as loudly as a missing one.
+ *
+ * The stakes are higher than usual: `@deepseek-ai/dsh-llm` is a *peer* here, so
+ * an unsatisfiable range is not a devDependency nuisance the consumer can paper
+ * over with `--legacy-peer-deps` — their install fails.
+ */
+test('peer range admits exactly the supported dsh prerelease lines', () => {
   const range = pkg.peerDependencies['@deepseek-ai/dsh-llm']
   assert.ok(range, 'the dsh-llm peer dependency must be declared')
 
-  // Form 1: a bare release bound resolves to no published version at all.
-  assert.ok(
-    !/^(>=\^~)?\s*\d+\.\d+\.\d+\s*$/.test(range.trim()),
-    `a bare non-prerelease comparator ("${range}") matches no published dsh version`,
+  const admitted = PUBLISHED.filter(version => satisfies(version, range))
+
+  assert.deepEqual(
+    admitted,
+    PUBLISHED.filter(version => SUPPORTED.includes(version)),
+    `peer range "${range}" does not admit exactly the supported lines`,
   )
 
-  // The lower bound must name a concrete prerelease, not a bare release.
-  assert.match(range, /0\.1\.2-rc\.\d+/, 'expected a 0.1.2-rc.N lower bound')
-
-  // Form 2: a single comparator group silently excludes the 0.1.5 line, which
-  // the alpha/rc dist-tags serve. Requiring an explicit 0.1.5 prerelease in the
-  // range catches that regression.
-  assert.match(range, /0\.1\.5-(alpha|rc)\.\d+/, 'expected an explicit 0.1.5-line comparator')
-
-  // Both lines must be joined as alternatives, not as one intersection.
-  assert.match(range, /\|\|/, 'the two prerelease lines must be separate comparator groups')
+  // Named separately so a failure says which line broke, not just "the sets
+  // differ".
+  for (const version of SUPPORTED) {
+    assert.ok(satisfies(version, range), `peer range must admit ${version}`)
+  }
+  for (const version of ['0.1.1-rc.2', '0.1.2-alpha.5', '0.1.2-rc.1']) {
+    assert.ok(!satisfies(version, range), `peer range must not admit pre-seam ${version}`)
+  }
 })
 
 test('cordis is a declared peer', () => {
