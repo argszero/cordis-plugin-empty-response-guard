@@ -4,8 +4,11 @@
 #   - set:
 #       - id: empty-response-guard
 #         config:
-#           mode: warn              # error | warn | off
-#           minReasoningChars: 0    # require N chars of reasoning first
+#           mode: warn                        # error | warn | off
+#           minReasoningChars: 0              # require N chars of reasoning first
+#           detectFabricatedStop: true        # shape 2 (discussion #6948)
+#           fabricatedStopNeedsCalibration: true
+#           fabricatedStopMaxPerSession: 3
 #
 # What it guards (discussion #6218): a provider completion carrying only
 # `reasoning_content`, ending with `stop`. The DeepSeek adapter's degeneracy
@@ -22,6 +25,18 @@
 # (agent-loop/src/agent.ts:443-453) where @deepseek-ai/dsh-llm-retry (mounted in
 # bundle/base and bundle/sdk-minimal) retries it. Reasoning content is never
 # removed — only the classification of the turn changes.
+#
+# v0.2.0 adds the other half of the same failure (discussion #6948): a relay can
+# truncate a response mid-stream and still send `finish=stop` with usage
+# 0/0/0. `mapStopReason` decides on `message.content.length === 0` alone
+# (llm-pi-ai/src/stream.ts:80, :99), so content that exists — even content cut
+# off mid-sentence — makes the turn a success and nothing retries it. The retry
+# machinery is not the problem (agent.ts:443 is not gated on partial content;
+# llm-retry decides on the code alone, retry-policy.ts:18); only detection is
+# missing. Zero usage is evidence only with a control, so a route's zero is
+# trusted only after that route has reported non-zero usage in this process, and
+# shape-2 corrections are bounded per session. Reported as TRANSPORT, not
+# EMPTY_RESPONSE: the caller did receive content.
 
 - insert:
     - id: empty-response-guard

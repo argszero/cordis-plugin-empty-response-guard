@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-empty-response-guard",
-  "description": "Empty-response guard for dsh: observes the llm/stream waterfall and reclassifies a reasoning-only completion (a stop with no text and no tool call) as EMPTY_RESPONSE, so the harness reports the failure and its retry policy can act instead of silently ending the turn. Reconciled with the in-tree guard family and AssistantStream's chunkHasVisibleText predicate. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
-  "version": "0.1.0",
+  "description": "Guards for silent successful turns in dsh: observes the llm/stream waterfall and reclassifies (1) a reasoning-only completion (a stop with no text and no tool call) as EMPTY_RESPONSE and (2) a stop whose usage accounts for zero tokens on a route that has reported usage as a retryable TRANSPORT error, so the harness reports the failure and its retry policy can act instead of silently ending the turn. Reconciled with the in-tree guard family and AssistantStream's chunkHasVisibleText predicate. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

@@ -2,12 +2,20 @@
 
 **A silent successful turn, reported as a failure so the retry policy can act.**
 
-A provider completion that carries only `reasoning_content` and stops is
-currently reported as a **successful** turn in dsh. No text, no tool call, no
-error, no retry — the session log records `turn/end` with `reason.kind =
-"completed"`. From the user's side the model "thought halfway and then stopped".
+A dsh turn can end as a **success** while nothing was actually delivered to the
+user. This plugin watches the `llm/stream` waterfall and reclassifies exactly
+two such shapes — both of them finishes the harness currently records as
+`reason.kind = "stop"` — as retryable errors:
 
-## The defect (discussion #6218)
+| shape | what the provider sent | what the user saw | source |
+| --- | --- | --- | --- |
+| **1** | `reasoning_content` only, then `stop` | "it thought halfway and stopped" | discussion [#6218](https://github.com/deepseek-ai/deepseek-harness/discussions/6218) |
+| **2** | text, then `stop`, with **usage accounting for zero tokens** | "the answer just stops mid-sentence" | discussion [#6948](https://github.com/deepseek-ai/deepseek-harness/discussions/6948) |
+
+Both are **seam** fixes: they make the failure visible and retryable at the
+stream boundary, without waiting for upstream to change every adapter.
+
+## Shape 1 — a `stop` with nothing visible (discussion #6218)
 
 Every adapter refuses a *completely* empty completion. The DeepSeek adapter
 decides that with the number of opened blocks:
@@ -35,7 +43,50 @@ The harness already owns the right predicate and never uses it:
 `chunkHasVisibleText` (`packages/llm/llm/src/assistant-stream.ts:290-293`)
 counts only non-whitespace `text-delta` / text `block-end`, and its exported
 roll-up `assistantStreamHasVisibleText` (`:361`) excludes reasoning by contract
-— **nothing in the tree consumes either one**.
+— **nothing in the tree consumes either one**. This plugin imports the first
+one, so a plugin and the core can never disagree about what counts as content.
+
+## Shape 2 — a `stop` whose usage accounts for nothing (discussion #6948)
+
+A relay can truncate a response mid-stream and still report a **successful
+completion**: the chunks arrive, the finish says `stop`, and the usage chunk
+says `0 / 0 / 0`. `mapStopReason` decides on `message.content.length === 0`
+alone (`packages/llm/llm-pi-ai/src/stream.ts:80`, `:99`), so content that
+exists — even content that stops mid-sentence — makes the turn a success, and
+nothing downstream retries it.
+
+**The retry machinery is not the problem.** The correction upstream needs is
+already there and is *not* gated on partial content:
+`packages/core/agent-loop/src/agent.ts:443` settles `assistant/attempt` and
+dispatches `agent/request-error` for any error finish, and
+`llm-retry` decides purely on the failure code
+(`packages/llm/llm-retry/src/index.ts:215`, `retry-policy.ts:18`). What is
+missing is only the **detection**.
+
+### Why the detector is built the way it is
+
+Text-level heuristics ("does it look like it stopped mid-sentence?") are not
+decidable, and guessing wrong costs real requests. Usage is the only handle the
+provider gives us — which creates the trap this plugin is mostly about: **a
+route that never reports usage must not be read as a route that reported zero.**
+
+Zero usage is evidence only **with a control**, so:
+
+- **Self-calibration.** A route's zero usage is trusted only after that route
+  has reported non-zero usage at least once in this process. In practice the
+  adapter emits `usage` before `finish` on every call, so a healthy call arms
+  its own route; a route that has never reported usage is never corrected.
+  Arming is announced once in the log, so "the guard declined because the route
+  never reported usage" is distinguishable from "the guard saw nothing".
+- **A per-session bound** (`fabricatedStopMaxPerSession`, default `3`). A relay
+  that has degraded keeps truncating, and each correction buys a retry cycle;
+  past the bound the guard reports the evidence and leaves the `stop` alone.
+  Shape-1 corrections are not counted — they are deterministic and cannot feed
+  themselves.
+- **A distinct failure code.** Shape 2 is reported as `TRANSPORT`, not
+  `EMPTY_RESPONSE`: the caller *did* receive content, so naming it after an
+  absent answer would misreport it. What failed is the transport's claim to have
+  delivered a whole one.
 
 ## Install and mount
 
@@ -53,21 +104,24 @@ The bundle patch mounts it; the plugin needs no configuration:
 
 ## What it does
 
-Observes the `llm/stream` waterfall, tallies each stream as it flows, and when
-the upstream finish says `stop` while no visible content appeared, emits that
-one chunk with an `error` finish instead:
+Observes the `llm/stream` waterfall, tallies each stream as it flows, and
+rewrites only the terminal chunk when a degenerate completion is detected:
 
 - **Streaming is preserved.** The verdict needs the finish, and the finish is
   the last chunk a provider sends — so nothing is buffered. Every chunk is
   forwarded the moment it arrives; live token streaming and the durable log are
   untouched. (A buffer-then-decide implementation would also be correct but
-  would stall every healthy request.)
+  would stall every healthy request. A test fails if this ever changes.)
 - **Reasoning is never removed or rewritten.** Only the classification of the
   turn changes.
 - **Reasoning followed by a tool call is progress**, not degeneracy, and passes
   through untouched.
 - **Non-`stop` finishes are never touched** (`tool-calls`, `max-tokens`,
   `aborted`, and a provider's own `error` each mean something else).
+- **Shape 1 wins when both apply**: a stream with no visible content *and* no
+  usage is described more precisely by `EMPTY_RESPONSE`, and both codes are
+  retryable, so the choice cannot change what the retry policy does.
+- A stream that carries **no usage chunk at all** is never shape 2.
 - The resulting finish routes to `agent/request-error`
   (`packages/core/agent-loop/src/agent.ts:443-453`) and is retried by
   `@deepseek-ai/dsh-llm-retry` — mounted in `bundle/base` and
@@ -77,9 +131,12 @@ one chunk with an `error` finish instead:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `mode` | `'error'` | `'error'` = reclassify as `EMPTY_RESPONSE`; `'warn'` = detect and log only; `'off'` = pure pass-through |
-| `minReasoningChars` | `0` | require N characters of reasoning before correcting; a model cut off after a few tokens is a different story |
+| `mode` | `'error'` | `'error'` = reclassify (as `EMPTY_RESPONSE` / `TRANSPORT`); `'warn'` = detect and log only; `'off'` = pure pass-through |
+| `minReasoningChars` | `0` | require N characters of reasoning before the shape-1 correction applies |
 | `reportReasoning` | `true` | include the reasoning character count in the synthesized message |
+| `detectFabricatedStop` | `true` | enable shape 2; `false` restores exactly the 0.1.0 behaviour |
+| `fabricatedStopNeedsCalibration` | `true` | only trust zero usage on a route that has previously reported usage |
+| `fabricatedStopMaxPerSession` | `3` | bound on shape-2 corrections per session; `0` removes the bound |
 
 ```yaml
 - set:
@@ -99,11 +156,12 @@ one chunk with an `error` finish instead:
 
 ## Scope, honestly
 
-This is a **seam** fix, not the core fix. The real repair belongs in
-`translate.ts` (and in any adapter sharing the shape): test for the absence of
-*visible* content rather than the absence of *any* block — the predicate already
-exists in the same package. Until upstream decides, this keeps the failure
-visible and retryable.
+These are **seam** fixes, not the core fix. The real repair belongs in
+`translate.ts` / `mapStopReason` (and in any adapter sharing the shape): test
+for the absence of *visible* content rather than the absence of *any* block —
+the predicate already exists in the same package — and refuse to call a
+completion complete when its own accounting says nothing was produced. Until
+upstream decides, this keeps the failure visible and retryable.
 
 ## Compatibility
 
@@ -117,10 +175,19 @@ nothing).
 npm test
 ```
 
-20 tests, including a divergence test that pins the contract break itself
-(`order.length` says success while the harness' own predicate says there is no
-content) and an incrementality test that fails if the guard ever starts
-buffering.
+45 tests:
+
+- `test/empty-response-guard.test.js` — shape 1, including a divergence test
+  that pins the contract break itself (`order.length` says success while the
+  harness' own predicate says there is no content) and an incrementality test
+  that fails if the guard ever starts buffering;
+- `test/fabricated-stop.test.js` — shape 2, its control (calibration), the
+  bound, and every config switch;
+- `test/cordis.test.js` — the wiring, on a **real cordis `Context`**: a real
+  `llm/stream` waterfall dispatches through the guard, the correction reaches
+  the consumer of the waterfall, the request is not mutated, and the
+  diagnostics a host reads to self-verify are actually emitted;
+- `test/peer-range.test.js` — the peer range admits both supported lines.
 
 ## License
 
